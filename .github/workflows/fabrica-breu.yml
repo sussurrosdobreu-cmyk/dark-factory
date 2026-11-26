@@ -1,0 +1,228 @@
+name: Fabrica Breu V1
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "Modo de producao"
+        type: choice
+        options:
+          - demo
+          - real
+        default: demo
+
+permissions:
+  contents: read
+
+jobs:
+  produzir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      MODO: ${{ inputs.modo }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar motor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg espeak fonts-dejavu-core
+          pip install faster-whisper==1.2.0 Pillow
+
+      - name: Produzir video
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess as sp
+          import os, math, re
+          from PIL import Image, ImageDraw
+
+          root = Path.cwd()
+          work = root / 'temp'
+          work.mkdir(exist_ok=True)
+          out = root / 'saida'
+          out.mkdir(exist_ok=True)
+
+          def run(*args):
+              sp.run([str(x) for x in args], check=True)
+
+          def ff(*args):
+              run('ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', *args)
+
+          def stamp(t):
+              ms = max(0, round(t * 1000))
+              h, ms = divmod(ms, 3600000)
+              m, ms = divmod(ms, 60000)
+              s, ms = divmod(ms, 1000)
+              return f'{h:02}:{m:02}:{s:02},{ms:03}'
+
+          if os.environ['MODO'] == 'demo':
+              images = []
+              for i in range(3):
+                  im = Image.new('RGB', (720, 1280), (18+i*8, 22, 29))
+                  d = ImageDraw.Draw(im)
+                  d.ellipse((60+i*70,100,310+i*70,350), fill=(85,85,83))
+                  for k in range(10):
+                      x = k*86-35
+                      d.polygon([(x-35,1280),(x+15,170+(k*97)%500),(x+48,1280)], fill=(8,10,13))
+                  d.rectangle((270,790,520,1050), fill=(31,24,24))
+                  d.polygon([(240,800),(395,650),(550,800)], fill=(12,12,15))
+                  d.rectangle((410,865,460,940), fill=(130,56,30))
+                  p = work / f'demo{i}.png'
+                  im.save(p)
+                  images.append(p)
+
+              audio = work / 'demo.wav'
+              run('espeak','-v','pt-br','-s','145','-w',audio,'Este e apenas um teste tecnico da fabrica Breu. Este video nao deve ser publicado.')
+
+          else:
+              images = sorted(
+                  [p for p in root.iterdir() if re.fullmatch(r'cena\d+\.(jpg|jpeg|png|webp)',p.name,re.I)],
+                  key=lambda p:int(re.search(r'\d+',p.stem).group())
+              )
+
+              audios = [
+                  p for p in root.iterdir()
+                  if p.stem.lower() == 'narracao'
+                  and p.suffix.lower() in {'.mp3','.wav','.m4a','.aac'}
+              ]
+
+              if not images or len(audios) != 1:
+                  raise SystemExit('Envie as cenas numeradas e uma narracao.')
+
+              audio = audios[0]
+
+          seconds = float(sp.check_output([
+              'ffprobe','-v','error',
+              '-show_entries','format=duration',
+              '-of','default=noprint_wrappers=1:nokey=1',
+              str(audio)
+          ]))
+
+          if not 1 <= seconds <= 180:
+              raise SystemExit('Duracao invalida.')
+
+          frames = math.ceil(seconds * 30)
+          if len(images) > frames:
+              raise SystemExit('Cenas demais.')
+
+          from faster_whisper import WhisperModel
+
+          model = WhisperModel(
+              'small',
+              device='cpu',
+              compute_type='int8',
+              cpu_threads=4
+          )
+
+          segments, _ = model.transcribe(
+              str(audio),
+              language='pt',
+              word_timestamps=True,
+              beam_size=3
+          )
+
+          cues = []
+
+          for seg in segments:
+              group = []
+              for w in seg.words or []:
+                  if group and (
+                      len(group) >= 5
+                      or w.end-group[0].start > 2.4
+                      or w.start-group[-1].end > 0.45
+                  ):
+                      cues.append((
+                          group[0].start,
+                          group[-1].end,
+                          ''.join(x.word for x in group).strip()
+                      ))
+                      group = []
+
+                  group.append(w)
+
+                  if re.search(r'[.!?]$',w.word.strip()):
+                      cues.append((
+                          group[0].start,
+                          group[-1].end,
+                          ''.join(x.word for x in group).strip()
+                      ))
+                      group = []
+
+              if group:
+                  cues.append((
+                      group[0].start,
+                      group[-1].end,
+                      ''.join(x.word for x in group).strip()
+                  ))
+
+          srt = work / 'legendas.srt'
+
+          srt.write_text(''.join(
+              f'{i}\n{stamp(a)} --> {stamp(b)}\n{t}\n\n'
+              for i,(a,b,t) in enumerate(cues,1)
+              if b>a and t
+          ), encoding='utf-8')
+
+          if not srt.read_text().strip():
+              raise SystemExit('Sem legendas.')
+
+          parts = []
+
+          for i,p in enumerate(images):
+              n = round((i+1)*frames/len(images))-round(i*frames/len(images))
+              dest = work / f'parte{i:03}.mp4'
+
+              zoom = "min(1+on*0.00045,1.10)" if i%2==0 else "max(1.10-on*0.00045,1.0)"
+
+              vf = f"scale=1440:2560:force_original_aspect_ratio=increase,crop=1440:2560,setsar=1,zoompan=z='{zoom}':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d={n}:s=1080x1920:fps=30,format=yuv420p"
+
+              ff('-filter_threads','1','-i',p,'-vf',vf,'-frames:v',n,'-an','-c:v','libx264','-threads','2','-preset','veryfast','-crf','21',dest)
+              parts.append(dest)
+
+          manifest = work / 'lista.txt'
+          manifest.write_text(''.join(
+              f"file '{p.name}'\n" for p in parts
+          ))
+
+          style = 'FontName=DejaVu Sans,FontSize=15,Bold=-1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,Alignment=2,MarginV=47,MarginL=20,MarginR=20'
+
+          ff(
+              '-filter_threads','1',
+              '-f','concat','-safe','0',
+              '-i',manifest,
+              '-i',audio,
+              '-vf',f"subtitles=temp/legendas.srt:force_style='{style}'",
+              '-map','0:v:0',
+              '-map','1:a:0',
+              '-c:v','libx264',
+              '-threads','2',
+              '-preset','veryfast',
+              '-crf','21',
+              '-c:a','aac',
+              '-b:a','160k',
+              '-af','loudnorm=I=-16:TP=-1.5:LRA=11',
+              '-t',str(seconds),
+              '-movflags','+faststart',
+              out/'video.mp4'
+          )
+
+          (out/'legendas.srt').write_bytes(srt.read_bytes())
+
+          print('FABRICA BREU: VIDEO CONCLUIDO')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-breu
+          path: saida/
+          retention-days: 3
+          if-no-files-found: error
+
+          
